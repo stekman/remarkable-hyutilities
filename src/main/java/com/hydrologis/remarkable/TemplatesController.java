@@ -4,6 +4,7 @@ import java.awt.Dimension;
 import java.awt.Toolkit;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
+import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.FilenameFilter;
 import java.io.IOException;
@@ -15,11 +16,12 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
+import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-import javax.swing.Action;
+import javax.imageio.ImageIO;
 import javax.swing.ImageIcon;
 import javax.swing.JComponent;
 import javax.swing.JFrame;
@@ -29,14 +31,16 @@ import javax.swing.table.DefaultTableModel;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import com.hydrologis.remarkable.progress.ActionWithProgress;
-import com.hydrologis.remarkable.progress.ProgressMonitor;
+import com.hydrologis.remarkable.progress.executor.ExecutorIndeterminateGui;
+import com.hydrologis.remarkable.progress.executor.ExecutorProgressGui;
+import com.hydrologis.remarkable.progress.executor.ProgressUpdate;
 import com.hydrologis.remarkable.utils.DefaultGuiBridgeImpl;
 import com.hydrologis.remarkable.utils.FileUtilities;
 import com.hydrologis.remarkable.utils.GuiBridgeHandler;
 import com.hydrologis.remarkable.utils.GuiUtilities;
 import com.hydrologis.remarkable.utils.GuiUtilities.IOnCloseListener;
 import com.hydrologis.remarkable.utils.IconsHandler;
+import com.hydrologis.remarkable.utils.TouchButtonToolsHandler;
 import com.jcraft.jsch.Channel;
 import com.jcraft.jsch.ChannelExec;
 import com.jcraft.jsch.JSchException;
@@ -45,7 +49,7 @@ import com.jcraft.jsch.Session;
 @SuppressWarnings("serial")
 public class TemplatesController extends TemplatesView implements IOnCloseListener {
 
-    private static final String VERSION = "v1.2";
+    private static final String VERSION = "v1.4";
 
     private static final String BACKUP_FOLDERNAME = "backup";
 
@@ -70,11 +74,9 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
     private MODE currentMode = MODE.TEMPLATES;
 
     private String[] remoteDataArray;
-    private List<String> localTemplatesNamesList = new ArrayList<>();
+    private List<File> localTemplatesNamesList = new ArrayList<>();
     private List<String> localGraphicsNamesList = new ArrayList<>();
     private List<String> localBackupNamesList = new ArrayList<>();
-
-    private Action backupAction;
 
     public TemplatesController( GuiBridgeHandler guiBridge ) {
         setPreferredSize(new Dimension(900, 800));
@@ -141,45 +143,20 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
 
         _remotePathField.setEditable(false);
 
-        ActionWithProgress getRemoteDataAction = new ActionWithProgress(this, "Get remote data...", 2, true){
-            @Override
-            public void onError( Exception e ) {
-                e.printStackTrace();
-                JOptionPane.showMessageDialog(parent, e.getLocalizedMessage(), "ERROR", JOptionPane.ERROR_MESSAGE);
-            }
-
-            @Override
-            public void backGroundWork( ProgressMonitor monitor ) throws Exception {
-                try (EasySession session = new EasySession()) {
-                    getRemoteData(session.getSession());
-                }
-            }
-        };
-        _refreshRemoteTemplatesButton.setAction(getRemoteDataAction);
         _refreshRemoteTemplatesButton.setText("refresh");
+        _refreshRemoteTemplatesButton.addActionListener(e -> {
+            new ExecutorIndeterminateGui(){
+                @Override
+                public void backGroundWork() throws Exception {
+                    publish(new ProgressUpdate("Get remote data...", 1));
+                    try (EasySession session = new EasySession()) {
+                        getRemoteData(session.getSession());
+                    }
+                }
+            }.execute();
+        });
 
         _uploadButton.setEnabled(false);
-
-        _backupButton.setVisible(false);
-        backupAction = new ActionWithProgress(this, "Backup", 4, false){
-            @Override
-            public void onError( Exception e ) {
-                e.printStackTrace();
-                JOptionPane.showMessageDialog(parent, e.getLocalizedMessage(), "ERROR", JOptionPane.ERROR_MESSAGE);
-            }
-
-            @Override
-            public void backGroundWork( ProgressMonitor monitor ) throws Exception {
-                backup(monitor);
-            }
-
-            @Override
-            public void postWork() throws Exception {
-                refreshLocal();
-            }
-        };
-        _backupButton.setAction(backupAction);
-        _backupButton.setText("Backup");
 
         _templatesModeButton.setSelected(true);
         _templatesModeButton.addActionListener(e -> {
@@ -187,7 +164,7 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
                 currentMode = MODE.TEMPLATES;
                 refreshLocal();
                 resetRemoteFields();
-                _backupButton.setVisible(false);
+                checkUploadButton();
             }
         });
         _graphicsModeButton.addActionListener(e -> {
@@ -195,7 +172,7 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
                 currentMode = MODE.GRAPHICS;
                 refreshLocal();
                 resetRemoteFields();
-                _backupButton.setVisible(false);
+                checkUploadButton();
             }
         });
         _backupModeButton.addActionListener(e -> {
@@ -203,29 +180,87 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
                 currentMode = MODE.BACKUP;
                 refreshLocal();
                 resetRemoteFields();
-
-                if (checkLocalPath(_basefolderField.getText())) {
-                    _backupButton.setVisible(true);
-                }
+                checkUploadButton();
             }
         });
 
-        ActionWithProgress restartAction = new ActionWithProgress(this, "Restart", 4, true){
-            @Override
-            public void onError( Exception e ) {
-                e.printStackTrace();
-                JOptionPane.showMessageDialog(parent, e.getLocalizedMessage(), "ERROR", JOptionPane.ERROR_MESSAGE);
-            }
+        _uploadButton.addActionListener(e -> {
+            if (currentMode == MODE.TEMPLATES) {
+                new ExecutorProgressGui(2 + localTemplatesNamesList.size()){
+                    @Override
+                    public void backGroundWork() throws Exception {
+                        int prog = 1;
+                        publish(new ProgressUpdate("Download templates configuration file...", prog++));
+                        // get the json and add the pngs to upload
+                        try (EasySession s1 = new EasySession()) {
+                            downloadTemplatesJson(s1.getSession());
+                        }
+                        File templatesFolder = getTemplatesFolder(null);
+                        String localJsonPath = templatesFolder.getAbsolutePath() + File.separator + TEMPLATES_JSON_NAME;
+                        try (EasySession s1 = new EasySession()) {
+                            publish(new ProgressUpdate("Upload new templates configuration file...", prog++));
+                            SshHelper.uploadFile(s1.getSession(), localJsonPath, REMOTE_TEMPLATES_JSON_PATH);
+                            for( File localTemplateFile : localTemplatesNamesList ) {
+                                publish(new ProgressUpdate("Upload template: " + localTemplateFile.getName(), prog++));
+                                SshHelper.uploadFile(s1.getSession(), localTemplateFile.getAbsolutePath(),
+                                        PreKeys.REMOTE_TEMPLATES_PATH + "/" + localTemplateFile.getName());
+                            }
+                        }
+                    }
+                }.execute();
+            } else if (currentMode == MODE.GRAPHICS) {
+                new ExecutorProgressGui(localGraphicsNamesList.size()){
+                    @Override
+                    public void backGroundWork() throws Exception {
+                        int prog = 1;
+                        File graphicsFolder = getGraphicsFolder(null);
+                        try (EasySession s1 = new EasySession()) {
+                            for( String localGraphicName : localGraphicsNamesList ) {
+                                File graphicToUpload = new File(graphicsFolder, localGraphicName);
+                                String remoteFile = PreKeys.REMOTE_GRAPHICS_PATH + "/" + localGraphicName;
+                                publish(new ProgressUpdate("Upload graphic: " + localGraphicName, prog++));
+                                SshHelper.uploadFile(s1.getSession(), graphicToUpload.getAbsolutePath(), remoteFile);
+                            }
+                        }
+                    }
+                }.execute();
+            } else if (currentMode == MODE.BACKUP) {
+                new ExecutorProgressGui(4){
+                    @Override
+                    public void backGroundWork() throws Exception {
+                        int prog = 1;
+                        File backupFolder = getBackupFolder(null);
+                        try (EasySession s1 = new EasySession()) {
+                            publish(new ProgressUpdate("Compressing remote data for backup (this might take a while...)",
+                                    prog++));
+                            compress(s1.getSession());
 
-            @Override
-            public void backGroundWork( ProgressMonitor monitor ) throws Exception {
-                try (EasySession s1 = new EasySession()) {
-                    SshHelper.launchSshCommand(s1.getSession(), "systemctl restart xochitl");
-                }
+                            publish(new ProgressUpdate(
+                                    "Downloading backup data (this might take a while depending on the size...)", prog++));
+                            File newBackup = new File(backupFolder, dateFormatter.format(new Date()) + "_backup.tar.gz");
+                            SshHelper.downloadFile(s1.getSession(), "~/backup.tar.gz", newBackup.getAbsolutePath());
+
+                            publish(new ProgressUpdate("Cleanup on device...", prog++));
+                            cleanup(s1.getSession());
+                            publish(new ProgressUpdate("Backup done!", prog++));
+                        }
+                    }
+                }.execute();
             }
-        };
-        _restartRemarkableButton.setAction(restartAction);
+        });
+
         _restartRemarkableButton.setText("Restart Device");
+        _restartRemarkableButton.addActionListener(e -> {
+            new ExecutorIndeterminateGui(){
+                @Override
+                public void backGroundWork() throws Exception {
+                    publish(new ProgressUpdate("Restart", 1));
+                    try (EasySession s1 = new EasySession()) {
+                        SshHelper.launchSshCommand(s1.getSession(), "systemctl restart xochitl");
+                    }
+                }
+            }.execute();
+        });
 
         _aboutButton.addActionListener(e -> {
             JOptionPane.showMessageDialog(this,
@@ -239,7 +274,29 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
         if (checkLocalPath(localPath)) {
             _basefolderField.setText(localPath);
         }
+
+        if (!TouchButtonToolsHandler.INSTANCE.checkToolsPaths()) {
+            _touchButtonToolsButton.setVisible(false);
+        } else {
+            _touchButtonToolsButton.addActionListener(e -> {
+                GuiUtilities.openDialogWithPanel(new TouchButtonToolsController(), "Touch & Button Tools",
+                        new Dimension(800, 700));
+            });
+        }
+
         refreshLocal();
+        checkHostUserPwdFolder();
+        checkUploadButton();
+    }
+
+    private void checkUploadButton() {
+        if (currentMode == MODE.TEMPLATES) {
+            _uploadButton.setText("Send templates to rM");
+        } else if (currentMode == MODE.GRAPHICS) {
+            _uploadButton.setText("Send graphics to rM");
+        } else if (currentMode == MODE.BACKUP) {
+            _uploadButton.setText("Make a backup of the rM");
+        }
     }
 
     private void resetRemoteFields() {
@@ -267,7 +324,6 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
         }
 
         _uploadButton.setEnabled(okToGo);
-        _backupButton.setEnabled(okToGo);
     }
 
     public static boolean ip( String text ) {
@@ -315,66 +371,6 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
         File baseFolderFile = new File(basePath);
         File templatesFile = new File(baseFolderFile, TEMPLATES_FOLDERNAME);
         return templatesFile;
-    }
-
-    private void uploadTemplates( ProgressMonitor monitor ) throws Exception {
-
-        int prog = 0;
-        monitor.setCurrent("Download templates configuration file...", prog);
-        // get the json and add the pngs to upload
-        try (EasySession s1 = new EasySession()) {
-            downloadTemplatesJson(s1.getSession());
-        }
-        monitor.setCurrent("Done.", prog++);
-
-        File templatesFolder = getTemplatesFolder(null);
-        String localJsonPath = templatesFolder.getAbsolutePath() + File.separator + TEMPLATES_JSON_NAME;
-        try (EasySession s1 = new EasySession()) {
-            monitor.setCurrent("Upload new templates configuration file....", prog);
-            SshHelper.uploadFile(s1.getSession(), localJsonPath, REMOTE_TEMPLATES_JSON_PATH);
-            monitor.setCurrent(null, prog++);
-
-            for( String localTemplateName : localTemplatesNamesList ) {
-                File templateToUpload = new File(templatesFolder, localTemplateName);
-
-                monitor.setCurrent("Upload template: " + localTemplateName, prog);
-                SshHelper.uploadFile(s1.getSession(), templateToUpload.getAbsolutePath(),
-                        PreKeys.REMOTE_TEMPLATES_PATH + "/" + localTemplateName);
-                monitor.setCurrent(null, prog++);
-            }
-        }
-
-    }
-
-    private void uploadGraphics( ProgressMonitor monitor ) throws Exception {
-        int prog = 0;
-        File graphicsFolder = getGraphicsFolder(null);
-        try (EasySession s1 = new EasySession()) {
-            for( String localGraphicName : localGraphicsNamesList ) {
-                File graphicToUpload = new File(graphicsFolder, localGraphicName);
-                String remoteFile = PreKeys.REMOTE_GRAPHICS_PATH + "/" + localGraphicName;
-                monitor.setCurrent("Upload graphic: " + localGraphicName, prog);
-                SshHelper.uploadFile(s1.getSession(), graphicToUpload.getAbsolutePath(), remoteFile);
-                monitor.setCurrent(null, prog++);
-            }
-        }
-    }
-
-    private void backup( ProgressMonitor monitor ) throws Exception {
-        int prog = 1;
-        File backupFolder = getBackupFolder(null);
-        try (EasySession s1 = new EasySession()) {
-            monitor.setCurrent("Compressing remote data for backup (this might take a while...)", prog++);
-            compress(s1.getSession());
-
-            monitor.setCurrent("Downloading backup data (this might take a while depending on the size...)", prog++);
-            File newBackup = new File(backupFolder, dateFormatter.format(new Date()) + "_backup.tar.gz");
-            SshHelper.downloadFile(s1.getSession(), "~/backup.tar.gz", newBackup.getAbsolutePath());
-
-            monitor.setCurrent("Cleanup on device...", prog++);
-            cleanup(s1.getSession());
-            monitor.setCurrent("Backup done!", prog++);
-        }
     }
 
     private void compress( Session session ) throws Exception {
@@ -456,30 +452,43 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
 
             String json = FileUtilities.readFile(localJsonPath);
             JSONObject root = new JSONObject(json);
+            JSONObject newRoot = new JSONObject();
+            JSONArray newTemplatesArray = new JSONArray();
+            newRoot.put(TEMPLATES_KEY_IN_JSON, newTemplatesArray);
+
+            TreeSet<String> templateNames = new TreeSet<>();
+            for( File localFile : localTemplatesNamesList ) {
+                String localName = localFile.getName();
+                localName = localName.replace(".png", "");
+
+                BufferedImage bi = ImageIO.read(localFile);
+                int w = bi.getWidth();
+                int h = bi.getHeight();
+                boolean isLandscape = w > h;
+                JSONObject newJson = getNewJson(localName.replace('_', ' '), localName, isLandscape);
+                newTemplatesArray.put(newJson);
+                templateNames.add(localName);
+            }
+
             JSONArray templatesArray = root.getJSONArray(TEMPLATES_KEY_IN_JSON);
-            List<String> remoteTemplateFileNames = new ArrayList<>();
             for( int i = 0; i < templatesArray.length(); i++ ) {
                 JSONObject templateObject = templatesArray.getJSONObject(i);
                 String fileName = templateObject.getString(FILENAME_KEY_IN_JSON);
-                String iconCode = templateObject.getString(ICONCODE_KEY_IN_JSON);
-                String iconString = IconsHandler.INSTANCE.getIconString(iconCode);
-                if (iconString != null) {
-                    templateObject.put(ICONCODE_KEY_IN_JSON, iconString);
+                if (templateObject.has(ICONCODE_KEY_IN_JSON)) {
+                    String iconCode = templateObject.getString(ICONCODE_KEY_IN_JSON);
+                    String iconString = IconsHandler.INSTANCE.getIconString(iconCode);
+                    if (iconString != null) {
+                        templateObject.put(ICONCODE_KEY_IN_JSON, iconString);
+                    }
                 }
-                remoteTemplateFileNames.add(fileName);
-            }
-
-            for( String localName : localTemplatesNamesList ) {
-                if (!remoteTemplateFileNames.contains(localName)) {
-                    localName = localName.replace(".png", "");
-                    JSONObject newJson = getNewJson(localName.replace('_', ' '), localName);
-                    templatesArray.put(newJson);
+                if (templateNames.add(fileName)) {
+                    newTemplatesArray.put(templateObject);
                 }
             }
 
             FileUtilities.copyFile(localJsonPath, localJsonPath + "_" + dateFormatter.format(new Date()));
 
-            String newTemplates = root.toString(2);
+            String newTemplates = newRoot.toString(2);
             newTemplates = newTemplates.replaceAll("\\\\\\\\", "\\\\");
             FileUtilities.writeFile(newTemplates, new File(localJsonPath));
 
@@ -490,11 +499,12 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
 
     }
 
-    private JSONObject getNewJson( String name, String fileName ) {
+    private JSONObject getNewJson( String name, String fileName, boolean isLandscape ) {
         String json = "{" + //
                 "       \"name\": \"" + name + "\"," + //
                 "       \"filename\": \"" + fileName + "\"," + //
                 "       \"iconCode\": \"" + IconsHandler.CUSTOM_ICON + "\"," + //
+                "       \"landscape\": \"" + (isLandscape ? "true" : "false") + "\"," + //
                 "       \"categories\": [" + //
                 "              \"Custom\"" + //
                 "       ]" + //
@@ -562,13 +572,12 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
                         return name.endsWith(".png");
                     }
                 });
-                localTemplatesNamesList = Arrays.asList(templateFiles).stream().map(f -> f.getName())
-                        .collect(Collectors.toList());
+                localTemplatesNamesList = Arrays.asList(templateFiles).stream().collect(Collectors.toList());
                 Collections.sort(localTemplatesNamesList);
 
                 String[][] templatesArray = new String[localTemplatesNamesList.size()][1];
                 for( int i = 0; i < templatesArray.length; i++ ) {
-                    templatesArray[i][0] = localTemplatesNamesList.get(i);
+                    templatesArray[i][0] = localTemplatesNamesList.get(i).getName();
                 }
                 _localTable.setModel(new DefaultTableModel(templatesArray, new String[]{"Template"}));
             }
@@ -608,39 +617,6 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
                 }
                 _localTable.setModel(new DefaultTableModel(backupsArray, new String[]{"Backup"}));
             }
-        }
-
-        int size = 0;
-        if (currentMode == MODE.TEMPLATES) {
-            size = localTemplatesNamesList.size();
-        } else if (currentMode == MODE.GRAPHICS) {
-            size = localGraphicsNamesList.size();
-        } else if (currentMode == MODE.BACKUP) {
-            size = 0; // no upload here
-        }
-        if (size != 0) {
-            _uploadButton.setEnabled(true);
-            ActionWithProgress uploadAction = new ActionWithProgress(this, "Upload", size, false){
-                @Override
-                public void onError( Exception e ) {
-                    JOptionPane.showMessageDialog(parent, "ERROR: " + e.getLocalizedMessage(), "ERROR",
-                            JOptionPane.ERROR_MESSAGE);
-                }
-
-                @Override
-                public void backGroundWork( ProgressMonitor monitor ) throws Exception {
-                    if (currentMode == MODE.TEMPLATES) {
-                        uploadTemplates(monitor);
-                    } else if (currentMode == MODE.GRAPHICS) {
-                        uploadGraphics(monitor);
-                    }
-
-                }
-            };
-            _uploadButton.setAction(uploadAction);
-            _uploadButton.setText("Upload local (selected mode)");
-        } else {
-            _uploadButton.setEnabled(false);
         }
     }
 
@@ -690,10 +666,7 @@ public class TemplatesController extends TemplatesView implements IOnCloseListen
         final TemplatesController controller = new TemplatesController(gBridge);
         final JFrame frame = gBridge.showWindow(controller.asJComponent(), "Remarkable HyUtilities " + VERSION);
 
-        Class<TemplatesController> class1 = TemplatesController.class;
-        URL resource = class1.getResource("/com/hydrologis/remarkable/hm150.png");
-        ImageIcon icon = new ImageIcon(resource);
-        frame.setIconImage(icon.getImage());
+        frame.setIconImage(IconsHandler.INSTANCE.getFrameIcon());
 
         GuiUtilities.addClosingListener(frame, controller);
 
