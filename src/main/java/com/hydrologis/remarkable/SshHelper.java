@@ -1,11 +1,6 @@
 package com.hydrologis.remarkable;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 
 import com.jcraft.jsch.Channel;
 import com.jcraft.jsch.ChannelExec;
@@ -101,8 +96,18 @@ public class SshHelper {
 
     }
 
+    private static String toUtf8(String str) {
+        try {
+            byte[] utfString = str.getBytes("UTF-8");
+            return new String(utfString,"UTF-8") ;
+        } catch (UnsupportedEncodingException e) {
+            return str;
+        }
+    }
+
     public static void uploadFile( Session session, String localFile, String remoteFile ) throws Exception {
         boolean ptimestamp = true;
+        remoteFile = toUtf8(remoteFile);
         // exec 'scp -t rfile' remotely
         String command = "scp " + (ptimestamp ? "-p" : "") + " -t \"" + remoteFile+"\"";
         Channel channel = session.openChannel("exec");
